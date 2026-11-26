@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -320,7 +321,7 @@ function assertSafeTaskName(taskName) {
 /**
  * Launch a PowerShell script completely outside Antigravity's Windows Job Object
  * (which sets KILL_ON_JOB_CLOSE without BREAKAWAY_OK) via Task Scheduler COM.
- * Runs in the user's interactive desktop session with zero UAC prompt.
+ * Passes the encoded inner script on stdin to avoid nested Base64 command-line bloat.
  */
 export function launchOutOfJobPowerShell(psScript, opts = {}) {
   if (process.platform !== 'win32') {
@@ -341,6 +342,8 @@ export function launchOutOfJobPowerShell(psScript, opts = {}) {
 
   const registerScript = `
 $ErrorActionPreference = 'Stop'
+$innerEncoded = [Console]::In.ReadLine()
+if ([string]::IsNullOrWhiteSpace($innerEncoded)) { throw 'Empty inner script' }
 $ts = New-Object -ComObject Schedule.Service
 $ts.Connect()
 $root = $ts.GetFolder('\\')
@@ -357,14 +360,14 @@ $td.Settings.DisallowStartIfOnBatteries = $false
 $td.Settings.StopIfGoingOnBatteries = $false
 $action = $td.Actions.Create(0)
 $action.Path = '${escapedPsExe}'
-$action.Arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${innerEncoded}'
+$action.Arguments = ('-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ' + $innerEncoded.Trim())
 $reg = $root.RegisterTaskDefinition('${escapedTask}', $td, 6, $null, $null, 3, $null)
 $null = $reg.Run($null)
 `;
   const registerEncoded = Buffer.from(registerScript, 'utf16le').toString('base64');
 
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       psExe,
       ['-NoProfile', '-NonInteractive', '-EncodedCommand', registerEncoded],
       { windowsHide: true, timeout: timeoutMs, maxBuffer: 65536 },
@@ -376,39 +379,240 @@ $null = $reg.Run($null)
         resolve(true);
       }
     );
+    try {
+      child.stdin.end(innerEncoded + '\n', 'utf8');
+    } catch (writeErr) {
+      reject(writeErr);
+    }
   });
 }
 
-async function spawnDetachedRelaunch(antigravityExe) {
-  if (process.platform !== 'win32') return false;
-  const fallbackExe = path.resolve(antigravityExe || resolveDefaultAntigravityExe());
-  const escapedFallback = fallbackExe.replace(/'/g, "''");
-  const taskName = 'AntigravityAccountSwitcherRelaunch';
-  const psScript = `
+export function escapeForJScriptString(str) {
+  let out = '';
+  const s = String(str ?? '');
+  for (let i = 0; i < s.length; i += 1) {
+    const code = s.charCodeAt(i);
+    if (code === 92) out += '\\\\';
+    else if (code === 34) out += '\\"';
+    else if (code === 39) out += "\\'";
+    else if (code === 10) out += '\\n';
+    else if (code === 13) out += '\\r';
+    else if (code === 9) out += '\\t';
+    else if (code < 0x20 || code >= 0x80) out += '\\u' + code.toString(16).padStart(4, '0');
+    else out += s[i];
+  }
+  return out;
+}
+
+export function buildRelaunchJScript(fallbackExe, taskName = 'AntigravityAccountSwitcherRelaunch') {
+  const safeTask = assertSafeTaskName(taskName);
+  const resolvedFallback = path.resolve(fallbackExe || resolveDefaultAntigravityExe());
+  const jsTask = escapeForJScriptString(safeTask);
+  const jsFallback = escapeForJScriptString(resolvedFallback);
+  const jsWmi = escapeForJScriptString('winmgmts:{impersonationLevel=impersonate}!\\\\.\\root\\cimv2');
+  return [
+    'var fso = new ActiveXObject("Scripting.FileSystemObject");',
+    'var sh = new ActiveXObject("WScript.Shell");',
+    'try {',
+    '  try {',
+    '    var ts = new ActiveXObject("Schedule.Service");',
+    '    ts.Connect();',
+    `    ts.GetFolder("\\\\").DeleteTask("${jsTask}", 0);`,
+    '  } catch (e) {}',
+    '  WScript.Sleep(150);',
+    `  var exePath = "${jsFallback}";`,
+    '  var launchArgs = "";',
+    '  var foundMain = false;',
+    `  var wmi = GetObject("${jsWmi}");`,
+    '  var procs = wmi.ExecQuery("SELECT ProcessId, Name, ExecutablePath, CommandLine FROM Win32_Process WHERE Name = \'Antigravity.exe\' OR Name LIKE \'language_server%\'");',
+    '  var en = new Enumerator(procs);',
+    '  var toKill = [];',
+    '  for (; !en.atEnd(); en.moveNext()) {',
+    '    var p = en.item();',
+    '    var nm = String(p.Name || "");',
+    '    var cmd = String(p.CommandLine || "");',
+    '    var ep = String(p.ExecutablePath || "");',
+    '    if (/^antigravity\\.exe$/i.test(nm)) {',
+    '      toKill.push(p);',
+    '      if (!foundMain && !/--type=|register_loader\\.js|\\bmain\\.mjs\\b/i.test(cmd)) {',
+    '        foundMain = true;',
+    '        if (ep && fso.FileExists(ep)) exePath = ep;',
+    '        var m = /^\\s*"([^"]+)"\\s*([\\s\\S]*)$/.exec(cmd);',
+    '        if (!m) m = /^\\s*(\\S+)\\s*([\\s\\S]*)$/.exec(cmd);',
+    '        if (m && m[2]) launchArgs = String(m[2]).replace(/^\\s+|\\s+$/g, "");',
+    '      }',
+    '    } else if (/antigravity/i.test(cmd) || /antigravity/i.test(ep)) {',
+    '      toKill.push(p);',
+    '    }',
+    '  }',
+    '  var appData = "";',
+    '  try { appData = sh.ExpandEnvironmentStrings("%APPDATA%"); } catch (e) {}',
+    '  if (appData && appData !== "%APPDATA%") {',
+    '    var cdpFile = fso.BuildPath(fso.BuildPath(appData, "Antigravity"), "DevToolsActivePort");',
+    '    if (!/--remote-debugging-port/i.test(launchArgs) && fso.FileExists(cdpFile)) {',
+    '      launchArgs = launchArgs ? (launchArgs + " --remote-debugging-port=0") : "--remote-debugging-port=0";',
+    '    }',
+    '  }',
+    '  for (var i = 0; i < toKill.length; i += 1) {',
+    '    try { toKill[i].Terminate(); } catch (e) {}',
+    '  }',
+    '  var waited = 0;',
+    '  while (waited < 6000) {',
+    '    var alive = 0;',
+    '    var q = wmi.ExecQuery("SELECT ProcessId, Name, ExecutablePath, CommandLine FROM Win32_Process WHERE Name = \'Antigravity.exe\' OR Name LIKE \'language_server%\'");',
+    '    var qe = new Enumerator(q);',
+    '    for (; !qe.atEnd(); qe.moveNext()) {',
+    '      var qp = qe.item();',
+    '      var qnm = String(qp.Name || "");',
+    '      var qcmd = String(qp.CommandLine || "");',
+    '      var qep = String(qp.ExecutablePath || "");',
+    '      if (/^antigravity\\.exe$/i.test(qnm) || /antigravity/i.test(qcmd) || /antigravity/i.test(qep)) {',
+    '        alive += 1;',
+    '        break;',
+    '      }',
+    '    }',
+    '    if (alive === 0) break;',
+    '    WScript.Sleep(50);',
+    '    waited += 50;',
+    '  }',
+    '  WScript.Sleep(150);',
+    '  if (fso.FileExists(exePath)) {',
+    '    var cmdLine = \'"\' + exePath + \'"\' + (launchArgs ? (" " + launchArgs) : "");',
+    '    sh.Run(cmdLine, 1, false);', // 1 = SW_SHOWNORMAL
+    '  }',
+    '} finally {',
+    '  try { fso.DeleteFile(WScript.ScriptFullName, true); } catch (e) {}',
+    '}',
+    '',
+  ].join('\r\n');
+}
+
+export function launchOutOfJobWScript(jscriptSource, opts = {}) {
+  if (process.platform !== 'win32') {
+    return Promise.reject(new Error('Task Scheduler COM is only supported on win32'));
+  }
+  const taskName = assertSafeTaskName(opts.taskName || 'AntigravityAccountSwitcherHelper');
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 10000;
+  const wscriptExe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+  if (!fs.existsSync(wscriptExe)) {
+    return Promise.reject(new Error('wscript.exe not found'));
+  }
+
+  const nonce = crypto.randomBytes(6).toString('hex');
+  const tmpDir = os.tmpdir();
+  const helperPath = path.join(tmpDir, `ag-as-helper-${nonce}.js`);
+  const regPath = path.join(tmpDir, `ag-as-reg-${nonce}.js`);
+
+  fs.writeFileSync(helperPath, String(jscriptSource || ''), { encoding: 'utf8', mode: 0o600 });
+
+  const jsWscriptExe = escapeForJScriptString(wscriptExe);
+  const jsHelperArgs = escapeForJScriptString(`//B //Nologo "${helperPath}"`);
+  const jsTask = escapeForJScriptString(taskName);
+  const regScript = [
+    'var ts = new ActiveXObject("Schedule.Service");',
+    'ts.Connect();',
+    'var root = ts.GetFolder("\\\\");',
+    'var td = ts.NewTask(0);',
+    'td.RegistrationInfo.Description = "Antigravity Account Switcher Out-Of-Job Helper";',
+    'td.Principal.LogonType = 3;',
+    'td.Principal.RunLevel = 0;',
+    'td.Settings.Enabled = true;',
+    'td.Settings.Hidden = true;',
+    'td.Settings.AllowDemandStart = true;',
+    'td.Settings.MultipleInstances = 2;',
+    'td.Settings.ExecutionTimeLimit = "PT2M";',
+    'td.Settings.DisallowStartIfOnBatteries = false;',
+    'td.Settings.StopIfGoingOnBatteries = false;',
+    'var action = td.Actions.Create(0);',
+    `action.Path = "${jsWscriptExe}";`,
+    `action.Arguments = "${jsHelperArgs}";`,
+    `var reg = root.RegisterTaskDefinition("${jsTask}", td, 6, null, null, 3, null);`,
+    'reg.Run(null);',
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(regPath, regScript, { encoding: 'utf8', mode: 0o600 });
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      wscriptExe,
+      ['//B', '//Nologo', regPath],
+      { windowsHide: true, timeout: timeoutMs, maxBuffer: 65536 },
+      (err, _stdout, stderr) => {
+        try {
+          fs.unlinkSync(regPath);
+        } catch {}
+        if (err) {
+          try {
+            fs.unlinkSync(helperPath);
+          } catch {}
+          reject(new Error(`WScript Task Scheduler launch failed: ${redactSecrets(stderr || err.message)}`));
+          return;
+        }
+        resolve(true);
+      }
+    );
+  });
+}
+
+export function buildRelaunchPsScript(fallbackExe, taskName = 'AntigravityAccountSwitcherRelaunch') {
+  const safeTask = assertSafeTaskName(taskName);
+  const escapedFallback = path.resolve(fallbackExe || resolveDefaultAntigravityExe()).replace(/'/g, "''");
+  const escapedTask = safeTask.replace(/'/g, "''");
+  return `
 $ErrorActionPreference = 'SilentlyContinue'
 try {
   $tsClean = New-Object -ComObject Schedule.Service
   $tsClean.Connect()
-  $tsClean.GetFolder('\\').DeleteTask('${taskName}', 0)
+  $tsClean.GetFolder('\\').DeleteTask('${escapedTask}', 0)
 } catch {}
-Start-Sleep -Milliseconds 600
+Start-Sleep -Milliseconds 150
 $exePath = '${escapedFallback}'
+$launchArgs = ''
+$wmiProcs = @(Get-CimInstance Win32_Process -Filter "Name = 'Antigravity.exe'" -ErrorAction SilentlyContinue)
+foreach ($wp in $wmiProcs) {
+  $cmd = [string]$wp.CommandLine
+  if ($cmd -match '--type=|register_loader\\.js|\\bmain\\.mjs\\b') { continue }
+  $ep = [string]$wp.ExecutablePath
+  if ($ep -and (Test-Path -LiteralPath $ep)) {
+    $exePath = $ep
+  }
+  if ($cmd -match '^"([^"]+)"\\s*(.*)$') {
+    $launchArgs = [string]$Matches[2]
+  } elseif ($cmd -match '^(\\S+)\\s*(.*)$') {
+    $launchArgs = [string]$Matches[2]
+  }
+  $launchArgs = $launchArgs.Trim()
+  break
+}
 $procs = @(Get-Process -Name 'Antigravity' -ErrorAction SilentlyContinue)
+if (-not $exePath -or -not (Test-Path -LiteralPath $exePath)) {
+  foreach ($p in $procs) {
+    try {
+      if ($p.Path -and (Test-Path -LiteralPath $p.Path)) {
+        $exePath = $p.Path
+        break
+      }
+    } catch {}
+  }
+}
+$cdpFile = if ($env:APPDATA) { Join-Path $env:APPDATA 'Antigravity\\DevToolsActivePort' } else { '' }
+if ($launchArgs -notmatch '--remote-debugging-port' -and $cdpFile -and (Test-Path -LiteralPath $cdpFile)) {
+  $launchArgs = if ($launchArgs) { "$launchArgs --remote-debugging-port=0" } else { '--remote-debugging-port=0' }
+}
+$sentClose = $false
 foreach ($p in $procs) {
   try {
-    if ($p.Path -and (Test-Path -LiteralPath $p.Path)) {
-      $exePath = $p.Path
-      break
+    if ($p.MainWindowHandle -ne 0 -and $p.CloseMainWindow()) {
+      $sentClose = $true
     }
   } catch {}
 }
-foreach ($p in $procs) {
-  try { $null = $p.CloseMainWindow() } catch {}
-}
-$deadline = (Get-Date).AddMilliseconds(2500)
-while ((Get-Date) -lt $deadline) {
-  if (-not (Get-Process -Name 'Antigravity' -ErrorAction SilentlyContinue)) { break }
-  Start-Sleep -Milliseconds 150
+if ($sentClose) {
+  $deadline = (Get-Date).AddMilliseconds(600)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Name 'Antigravity' -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 50
+  }
 }
 Get-Process -Name 'Antigravity' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 $langProcs = Get-CimInstance Win32_Process -Filter "Name LIKE 'language_server%'" -ErrorAction SilentlyContinue
@@ -419,18 +623,39 @@ foreach ($lp in $langProcs) {
     Stop-Process -Id $lp.ProcessId -Force -ErrorAction SilentlyContinue
   }
 }
-$waitExit = (Get-Date).AddMilliseconds(8000)
+$waitExit = (Get-Date).AddMilliseconds(6000)
 while ((Get-Date) -lt $waitExit) {
-  if (-not (Get-Process -Name 'Antigravity' -ErrorAction SilentlyContinue)) { break }
-  Start-Sleep -Milliseconds 150
+  $agAlive = @(Get-Process -Name 'Antigravity' -ErrorAction SilentlyContinue)
+  $lsAlive = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'language_server%'" -ErrorAction SilentlyContinue | Where-Object {
+    ([string]$_.CommandLine -match 'antigravity') -or ([string]$_.ExecutablePath -match 'antigravity')
+  })
+  if ($agAlive.Count -eq 0 -and $lsAlive.Count -eq 0) { break }
+  Start-Sleep -Milliseconds 50
 }
-Start-Sleep -Milliseconds 400
+Start-Sleep -Milliseconds 150
 if (Test-Path -LiteralPath $exePath) {
-  Start-Process -FilePath $exePath | Out-Null
+  if (-not [string]::IsNullOrWhiteSpace($launchArgs)) {
+    Start-Process -FilePath $exePath -ArgumentList $launchArgs -WindowStyle Normal | Out-Null
+  } else {
+    Start-Process -FilePath $exePath -WindowStyle Normal | Out-Null
+  }
 }
 `;
-  await launchOutOfJobPowerShell(psScript, { taskName });
-  return true;
+}
+
+async function spawnDetachedRelaunch(antigravityExe) {
+  if (process.platform !== 'win32') return false;
+  const fallbackExe = path.resolve(antigravityExe || resolveDefaultAntigravityExe());
+  const taskName = 'AntigravityAccountSwitcherRelaunch';
+  try {
+    const jscriptSource = buildRelaunchJScript(fallbackExe, taskName);
+    await launchOutOfJobWScript(jscriptSource, { taskName });
+    return true;
+  } catch {
+    const psScript = buildRelaunchPsScript(fallbackExe, taskName);
+    await launchOutOfJobPowerShell(psScript, { taskName });
+    return true;
+  }
 }
 
 function updateSqliteCurrentAccount(sqlitePath, accountId, nowSec) {

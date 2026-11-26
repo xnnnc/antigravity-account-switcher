@@ -1505,16 +1505,23 @@
       if (destroyed) return;
 
       if (res && res.ok) {
+        if (Array.isArray(res.accounts)) {
+          state.accounts = res.accounts;
+        }
         if (res.switchedId && res.switchedId !== state.activeId) {
           state.liveQuota = null;
           state.activeId = res.switchedId;
+        } else if (res.activeId) {
+          state.activeId = res.activeId;
         }
-        await refreshAccounts({ silent: true });
         showToast(
           res.message || 'Antigravity yeniden başlatılıyor...',
           'info',
           4200
         );
+        if (!res.restarted) {
+          await refreshAccounts({ silent: true });
+        }
       } else {
         showToast(res?.error || 'Hesap değiştirilemedi', 'error', 4500);
       }

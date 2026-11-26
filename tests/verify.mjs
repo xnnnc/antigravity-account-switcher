@@ -22,9 +22,13 @@ import {
   writeAccountRecord,
 } from '../sidecars/daemon/cockpit-store.mjs';
 import {
+  buildRelaunchJScript,
+  buildRelaunchPsScript,
   deleteWindowsCredential,
+  escapeForJScriptString,
   formatUtcRfc3339Micros,
   launchOutOfJobPowerShell,
+  launchOutOfJobWScript,
   switchAccountNative,
   writeWindowsCredential,
 } from '../sidecars/daemon/native-switcher.mjs';
@@ -788,13 +792,88 @@ async function main() {
       return summaryNote;
     });
 
-    // 8. Out-of-Job Relaunch Probe via Task Scheduler COM (harmless self-test, does not touch Antigravity)
-    await runCheck('8. Out-of-Job Task Scheduler launch probe (svchost parent, interactive session)', async () => {
+    // 8. Out-of-Job Relaunch Probe via Task Scheduler COM (WScript GUI zero-flash + PowerShell fallback)
+    await runCheck('8. Out-of-Job Task Scheduler launch probe (wscript.exe zero-flash + svchost parent)', async () => {
+      const jsRelaunchScript = buildRelaunchJScript('C:\\App\\Antigravity.exe');
+      assert.ok(jsRelaunchScript.includes('--remote-debugging-port'), 'JScript relaunch missing --remote-debugging-port');
+      assert.ok(jsRelaunchScript.includes('language_server'), 'JScript relaunch missing language_server cleanup');
+      assert.ok(jsRelaunchScript.includes(', 1, false)'), 'JScript relaunch missing SW_SHOWNORMAL run flags');
+      assert.equal(/\b(?:const|let)\s+|=>/.test(jsRelaunchScript), false, 'JScript must be pure ES3 (no const/let/=>)');
+
+      const psRelaunchScript = buildRelaunchPsScript('C:\\App\\Antigravity.exe');
+      assert.ok(psRelaunchScript.includes('--remote-debugging-port'), 'PS relaunch script missing --remote-debugging-port');
+      assert.ok(psRelaunchScript.includes('-WindowStyle Normal'), 'PS relaunch script missing -WindowStyle Normal');
+      assert.ok(psRelaunchScript.includes('language_server'), 'PS relaunch script missing language_server cleanup');
+
+      const wsTaskName = 'AntigravityAccountSwitcherWScriptSelfTest';
+      const wsProbeFile = path.join(tmpRoot, 'out_of_job_wscript_probe.json');
+      const wsProbe = [
+        'var fso = new ActiveXObject("Scripting.FileSystemObject");',
+        'var sh = new ActiveXObject("WScript.Shell");',
+        'try {',
+        '  try {',
+        '    var ts = new ActiveXObject("Schedule.Service");',
+        '    ts.Connect();',
+        `    ts.GetFolder("\\\\").DeleteTask("${escapeForJScriptString(wsTaskName)}", 0);`,
+        '  } catch (e) {}',
+        `  var wmi = GetObject("${escapeForJScriptString('winmgmts:{impersonationLevel=impersonate}!\\\\.\\root\\cimv2')}");`,
+        '  var selfFull = String(WScript.FullName || "");',
+        '  var exeName = fso.GetFileName(selfFull);',
+        '  var scriptFull = String(WScript.ScriptFullName || "");',
+        '  var en = new Enumerator(wmi.ExecQuery("SELECT ProcessId, ParentProcessId, SessionId, Name FROM Win32_Process WHERE Name = \'wscript.exe\'"));',
+        '  var myPid = 0; var parentPid = 0; var sessionId = 0;',
+        '  for (; !en.atEnd(); en.moveNext()) {',
+        '    var p = en.item();',
+        '    myPid = Number(p.ProcessId) || 0;',
+        '    parentPid = Number(p.ParentProcessId) || 0;',
+        '    sessionId = Number(p.SessionId) || 0;',
+        '  }',
+        '  var parentName = "";',
+        '  if (parentPid > 0) {',
+        '    var pe = new Enumerator(wmi.ExecQuery("SELECT Name FROM Win32_Process WHERE ProcessId = " + parentPid));',
+        '    if (!pe.atEnd()) parentName = String(pe.item().Name || "");',
+        '  }',
+        '  var esc = function(s) { return String(s).replace(/\\\\/g, "\\\\\\\\").replace(/"/g, "\\\\\\""); };',
+        '  var json = \'{"parentPid":\' + parentPid + \',"parentName":"\' + esc(parentName) + \'","exeName":"\' + esc(exeName) + \'","sessionId":\' + sessionId + \',"pid":\' + myPid + \',"scriptPath":"\' + esc(scriptFull) + \'"}\';',
+        `  var tf = fso.CreateTextFile("${escapeForJScriptString(wsProbeFile)}", true, false);`,
+        '  tf.Write(json);',
+        '  tf.Close();',
+        '} finally {',
+        '  try { fso.DeleteFile(WScript.ScriptFullName, true); } catch (e) {}',
+        '}',
+        '',
+      ].join('\r\n');
+
+      const wsStarted = Date.now();
+      await launchOutOfJobWScript(wsProbe, { taskName: wsTaskName, timeoutMs: 10000 });
+      const wsDeadline = Date.now() + 8000;
+      while (!fs.existsSync(wsProbeFile) && Date.now() < wsDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const wsElapsedMs = Date.now() - wsStarted;
+      assert.ok(fs.existsSync(wsProbeFile), 'Out-of-Job WScript helper did not write probe output within 8s');
+      const wsResult = JSON.parse(fs.readFileSync(wsProbeFile, 'utf8'));
+      assert.equal(
+        String(wsResult.exeName || '').toLowerCase(),
+        'wscript.exe',
+        `Expected GUI-subsystem wscript.exe, got ${wsResult.exeName}`
+      );
+      assert.equal(
+        String(wsResult.parentName || '').toLowerCase(),
+        'svchost.exe',
+        `Expected Task Scheduler svchost.exe parent, got ${wsResult.parentName}`
+      );
+      assert.ok(Number(wsResult.sessionId) >= 1, `Expected interactive sessionId >= 1, got ${wsResult.sessionId}`);
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(fs.existsSync(wsResult.scriptPath), false, `Temp helper script was not self-deleted: ${wsResult.scriptPath}`);
+
       const probeTaskName = 'AntigravityAccountSwitcherSelfTest';
       const probeFile = path.join(tmpRoot, 'out_of_job_probe.json');
       const escapedProbeFile = probeFile.replace(/'/g, "''");
+      const padComment = `# ${'relaunch-stdin-padding '.repeat(24)}\n`.repeat(5);
       const probeScript = `
 $ErrorActionPreference = 'Stop'
+${padComment}
 try {
   $tsClean = New-Object -ComObject Schedule.Service
   $tsClean.Connect()
@@ -811,6 +890,7 @@ $obj = @{
 } | ConvertTo-Json -Compress
 [System.IO.File]::WriteAllText('${escapedProbeFile}', $obj, [System.Text.Encoding]::UTF8)
 `;
+      assert.ok(probeScript.length >= 2200, `Expected >=2200 char probeScript, got ${probeScript.length}`);
       await launchOutOfJobPowerShell(probeScript, { taskName: probeTaskName, timeoutMs: 10000 });
       const deadline = Date.now() + 8000;
       while (!fs.existsSync(probeFile) && Date.now() < deadline) {
@@ -831,12 +911,12 @@ $obj = @{
           '-NoProfile',
           '-NonInteractive',
           '-Command',
-          `$ts = New-Object -ComObject Schedule.Service; $ts.Connect(); try { $null = $ts.GetFolder('\\').GetTask('${probeTaskName}'); 'EXISTS' } catch { 'CLEAN' }`,
+          `$ts = New-Object -ComObject Schedule.Service; $ts.Connect(); $r = @(); foreach ($n in @('${wsTaskName}','${probeTaskName}')) { try { $null = $ts.GetFolder('\\').GetTask($n); $r += $n } catch {} }; if ($r.Count -eq 0) { 'CLEAN' } else { $r -join ',' }`,
         ],
         { encoding: 'utf8', windowsHide: true, timeout: 6000 }
       ).trim();
-      assert.equal(checkTaskExists, 'CLEAN', `Task ${probeTaskName} was not cleaned up`);
-      return `parent=${probe.parentName} (pid=${probe.parentPid}), sessionId=${probe.sessionId}, pid=${probe.pid}, task=${checkTaskExists}`;
+      assert.equal(checkTaskExists, 'CLEAN', `Tasks not cleaned up: ${checkTaskExists}`);
+      return `exe=${wsResult.exeName} (${wsElapsedMs}ms), parent=${wsResult.parentName} (pid=${wsResult.parentPid}), sessionId=${wsResult.sessionId}, psFallback=ok, task=${checkTaskExists}`;
     });
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });

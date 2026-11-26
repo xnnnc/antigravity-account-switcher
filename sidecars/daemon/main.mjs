@@ -396,6 +396,26 @@ export class AccountSwitcherDaemon {
     this._inFlightRpcs = new Set();
     this._rpcWaiters = new Set();
     this._lastWatchSig = '';
+    this._initialBackendSig = '';
+    this._backendReloadTriggered = false;
+  }
+
+  _computeBackendFilesSignature() {
+    const files = [
+      path.join(__dirname, 'main.mjs'),
+      path.join(__dirname, 'native-switcher.mjs'),
+      path.join(__dirname, 'cockpit-store.mjs'),
+    ];
+    return files
+      .map((f) => {
+        try {
+          const st = fs.statSync(f);
+          return `${st.mtimeMs}:${st.size}`;
+        } catch {
+          return '0';
+        }
+      })
+      .join('|');
   }
 
   _computeWatchFilesSignature() {
@@ -757,6 +777,8 @@ export class AccountSwitcherDaemon {
   async start() {
     this.running = true;
     this._lastWatchSig = this._computeWatchFilesSignature();
+    this._initialBackendSig = this._computeBackendFilesSignature();
+    this._backendReloadTriggered = false;
     console.error(`[account-switcher] daemon started (poll=${this.pollMs}ms)`);
     await this.syncOnce();
     this._pollTimer = setInterval(() => {
@@ -764,6 +786,17 @@ export class AccountSwitcherDaemon {
       void (async () => {
         await this.syncOnce();
         await this._pushUpdatesIfFilesChanged();
+        if (
+          !this._backendReloadTriggered &&
+          typeof this.opts.onBackendChanged === 'function' &&
+          this.running &&
+          this._inFlightRpcs.size === 0 &&
+          this._initialBackendSig &&
+          this._computeBackendFilesSignature() !== this._initialBackendSig
+        ) {
+          this._backendReloadTriggered = true;
+          this.opts.onBackendChanged();
+        }
       })();
     }, this.pollMs);
   }
@@ -789,11 +822,22 @@ async function cliMain() {
     process.exit(0);
   }
 
-  const daemon = new AccountSwitcherDaemon();
+  let daemon;
   const shutdown = () => {
-    daemon.stop();
+    if (daemon) daemon.stop();
     if (releasePid) releasePid();
   };
+  daemon = new AccountSwitcherDaemon(
+    once
+      ? {}
+      : {
+          onBackendChanged: () => {
+            console.error('[account-switcher] backend changed on disk, exiting for sidecar reload');
+            shutdown();
+            process.exit(0);
+          },
+        }
+  );
   process.on('SIGINT', () => {
     shutdown();
     process.exit(0);
