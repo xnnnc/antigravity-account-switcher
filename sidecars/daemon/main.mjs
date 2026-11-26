@@ -424,6 +424,7 @@ export class AccountSwitcherDaemon {
       paths.sqlitePath,
       `${paths.sqlitePath}-wal`,
       paths.labelsFile,
+      paths.cacheDir,
     ];
     return files
       .map((f) => {

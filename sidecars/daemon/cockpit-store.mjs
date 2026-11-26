@@ -318,20 +318,26 @@ export function setLabel(accountId, label, opts = {}) {
   return { accountId: safeId, label: cleaned || null, labels };
 }
 
+export function parseTimestampMs(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
+  }
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+  }
+  return null;
+}
+
 /**
  * Format an ISO resetTime timestamp or epoch ms into a clean compact countdown string (e.g. "4h 32m", "6d 23h").
  */
 export function formatResetTime(value, nowMs = Date.now()) {
-  if (value === null || value === undefined || value === '') return null;
-  const targetMs =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string'
-        ? Date.parse(value)
-        : NaN;
-  if (!Number.isFinite(targetMs)) return null;
+  const targetMs = parseTimestampMs(value);
+  if (targetMs === null) return null;
   const diffMs = targetMs - nowMs;
-  if (diffMs <= 0) return '0m';
+  if (diffMs <= 0) return 'Hazır';
   const totalMins = Math.floor(diffMs / 60000);
   if (totalMins < 1) return '<1m';
   const days = Math.floor(totalMins / 1440);
@@ -344,6 +350,51 @@ export function formatResetTime(value, nowMs = Date.now()) {
     return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
   }
   return `${mins}m`;
+}
+
+/**
+ * Resolve window quotas locally when server-provided 5h / 7d reset timestamps have elapsed.
+ * Makes zero network requests and respects an exhausted weekly quota cap (quotaWeekly === 0).
+ */
+export function resolveEffectiveWindowQuota(
+  { quota5h, quotaWeekly, reset5hAtMs, resetWeeklyAtMs, reset5h, resetWeekly },
+  nowMs = Date.now()
+) {
+  const r5Ms = parseTimestampMs(reset5hAtMs);
+  const rWMs = parseTimestampMs(resetWeeklyAtMs);
+  const weeklyExpired = Boolean(rWMs && rWMs <= nowMs);
+  const fiveExpired = Boolean(r5Ms && r5Ms <= nowMs);
+
+  let q5 = typeof quota5h === 'number' && Number.isFinite(quota5h) ? quota5h : null;
+  let qW = typeof quotaWeekly === 'number' && Number.isFinite(quotaWeekly) ? quotaWeekly : null;
+  let r5 = r5Ms ? formatResetTime(r5Ms, nowMs) : (reset5h ?? null);
+  let rW = rWMs ? formatResetTime(rWMs, nowMs) : (resetWeekly ?? null);
+
+  if (weeklyExpired) {
+    if (qW !== null || q5 !== null) {
+      qW = 100;
+      q5 = 100;
+    }
+    rW = 'Hazır';
+    r5 = 'Hazır';
+  } else if (fiveExpired) {
+    if (qW === 0) {
+      q5 = 0;
+      r5 = '—';
+    } else {
+      q5 = 100;
+      r5 = 'Hazır';
+    }
+  }
+
+  return {
+    quota5h: q5,
+    quotaWeekly: qW,
+    reset5h: r5,
+    resetWeekly: rW,
+    reset5hAtMs: r5Ms,
+    resetWeeklyAtMs: rWMs,
+  };
 }
 
 function toQuotaPercentFromFraction(rawFraction) {
@@ -369,7 +420,15 @@ function findBucket(buckets, windowKey) {
  * Read cached quota percentages & reset timers from quota_api_v1_desktop/authorized/<sha256(email)>.json.
  */
 export function parseQuotaFromCache(email, opts = {}) {
-  const empty = { quota5h: null, quotaWeekly: null, reset5h: null, resetWeekly: null, updatedAtMs: 0 };
+  const empty = {
+    quota5h: null,
+    quotaWeekly: null,
+    reset5h: null,
+    resetWeekly: null,
+    reset5hAtMs: null,
+    resetWeeklyAtMs: null,
+    updatedAtMs: 0,
+  };
   const normalized = normalizeEmailForHash(email);
   if (!normalized) return empty;
   const { cacheDir } = resolvePaths(opts);
@@ -413,11 +472,16 @@ export function parseQuotaFromCache(email, opts = {}) {
     bucketWeekly = groups.weekly || null;
   }
 
+  const reset5hAtMs = parseTimestampMs(bucket5h?.resetTime);
+  const resetWeeklyAtMs = parseTimestampMs(bucketWeekly?.resetTime);
+
   return {
     quota5h: toQuotaPercentFromFraction(bucket5h?.remainingFraction),
     quotaWeekly: toQuotaPercentFromFraction(bucketWeekly?.remainingFraction),
-    reset5h: formatResetTime(bucket5h?.resetTime, nowMs),
-    resetWeekly: formatResetTime(bucketWeekly?.resetTime, nowMs),
+    reset5h: formatResetTime(reset5hAtMs, nowMs),
+    resetWeekly: formatResetTime(resetWeeklyAtMs, nowMs),
+    reset5hAtMs,
+    resetWeeklyAtMs,
     updatedAtMs,
   };
 }
@@ -454,11 +518,15 @@ function parseQuotaFromUsageHistory(historyEntry, nowMs = Date.now()) {
   const latest = geminiPool.points[geminiPool.points.length - 1];
   if (!Array.isArray(latest) || latest.length < 2) return null;
   const tsMs = Number(latest[0]) || Number(historyEntry.updatedAtMs) || 0;
+  const reset5hAtMs = parseTimestampMs(geminiPool.reset5hMs);
+  const resetWeeklyAtMs = parseTimestampMs(geminiPool.resetWeeklyMs);
   return {
     quota5h: toQuotaPercentFromPct(latest[1]),
     quotaWeekly: latest.length >= 3 ? toQuotaPercentFromPct(latest[2]) : null,
-    reset5h: formatResetTime(geminiPool.reset5hMs, nowMs),
-    resetWeekly: formatResetTime(geminiPool.resetWeeklyMs, nowMs),
+    reset5h: formatResetTime(reset5hAtMs, nowMs),
+    resetWeekly: formatResetTime(resetWeeklyAtMs, nowMs),
+    reset5hAtMs,
+    resetWeeklyAtMs,
     updatedAtMs: tsMs,
   };
 }
@@ -698,16 +766,33 @@ export async function listAccounts(opts = {}) {
       histQuota.quota5h !== null &&
       (histQuota.updatedAtMs >= cacheQuota.updatedAtMs || cacheQuota.quota5h === null);
 
-    const quota5h = useHist ? histQuota.quota5h : cacheQuota.quota5h;
-    const quotaWeekly = useHist
+    const rawQuota5h = useHist ? histQuota.quota5h : cacheQuota.quota5h;
+    const rawQuotaWeekly = useHist
       ? histQuota.quotaWeekly ?? cacheQuota.quotaWeekly
       : cacheQuota.quotaWeekly ?? histQuota?.quotaWeekly ?? null;
-    const reset5h = useHist
+    const rawReset5h = useHist
       ? histQuota.reset5h ?? cacheQuota.reset5h
       : cacheQuota.reset5h ?? histQuota?.reset5h ?? null;
-    const resetWeekly = useHist
+    const rawResetWeekly = useHist
       ? histQuota.resetWeekly ?? cacheQuota.resetWeekly
       : cacheQuota.resetWeekly ?? histQuota?.resetWeekly ?? null;
+    const rawReset5hAtMs = useHist
+      ? histQuota.reset5hAtMs ?? cacheQuota.reset5hAtMs
+      : cacheQuota.reset5hAtMs ?? histQuota?.reset5hAtMs ?? null;
+    const rawResetWeeklyAtMs = useHist
+      ? histQuota.resetWeeklyAtMs ?? cacheQuota.resetWeeklyAtMs
+      : cacheQuota.resetWeeklyAtMs ?? histQuota?.resetWeeklyAtMs ?? null;
+    const resolvedQuota = resolveEffectiveWindowQuota(
+      {
+        quota5h: rawQuota5h,
+        quotaWeekly: rawQuotaWeekly,
+        reset5hAtMs: rawReset5hAtMs,
+        resetWeeklyAtMs: rawResetWeeklyAtMs,
+        reset5h: rawReset5h,
+        resetWeekly: rawResetWeekly,
+      },
+      nowMs
+    );
 
     let disabled = false;
     let tier = formatTier(row.plan_type);
@@ -750,10 +835,12 @@ export async function listAccounts(opts = {}) {
       isCurrent: false,
       disabled,
       tier,
-      quota5h,
-      quotaWeekly,
-      reset5h,
-      resetWeekly,
+      quota5h: resolvedQuota.quota5h,
+      quotaWeekly: resolvedQuota.quotaWeekly,
+      reset5h: resolvedQuota.reset5h,
+      resetWeekly: resolvedQuota.resetWeekly,
+      reset5hAtMs: resolvedQuota.reset5hAtMs,
+      resetWeeklyAtMs: resolvedQuota.resetWeeklyAtMs,
       lastUsed,
     };
   });
@@ -796,18 +883,30 @@ export async function listAccounts(opts = {}) {
           : typeof cliSnapshot?.quotas?.weekly?.remainingIntPct === 'number'
             ? Math.max(0, Math.min(100, Math.floor(cliSnapshot.quotas.weekly.remainingIntPct)))
             : toQuotaPercentFromPct(snapActivePool.weeklyRemainingPct);
-    const liveReset5h = formatResetTime(snapActivePool.resetTime, nowMs);
-    const liveResetWeekly = formatResetTime(
-      snapActivePool.weeklyResetTime || cliSnapshot?.quotas?.weekly?.resetTime,
+    const liveReset5hAtMs = parseTimestampMs(snapActivePool.resetTime) ?? item.reset5hAtMs;
+    const liveResetWeeklyAtMs =
+      parseTimestampMs(snapActivePool.weeklyResetTime || cliSnapshot?.quotas?.weekly?.resetTime) ??
+      item.resetWeeklyAtMs;
+    const liveResolved = resolveEffectiveWindowQuota(
+      {
+        quota5h: live5h ?? item.quota5h,
+        quotaWeekly: liveWeekly ?? item.quotaWeekly,
+        reset5hAtMs: liveReset5hAtMs,
+        resetWeeklyAtMs: liveResetWeeklyAtMs,
+        reset5h: formatResetTime(liveReset5hAtMs, nowMs) ?? item.reset5h,
+        resetWeekly: formatResetTime(liveResetWeeklyAtMs, nowMs) ?? item.resetWeekly,
+      },
       nowMs
     );
     return {
       ...item,
       isCurrent,
-      quota5h: live5h ?? item.quota5h,
-      quotaWeekly: liveWeekly ?? item.quotaWeekly,
-      reset5h: liveReset5h ?? item.reset5h,
-      resetWeekly: liveResetWeekly ?? item.resetWeekly,
+      quota5h: liveResolved.quota5h,
+      quotaWeekly: liveResolved.quotaWeekly,
+      reset5h: liveResolved.reset5h,
+      resetWeekly: liveResolved.resetWeekly,
+      reset5hAtMs: liveResolved.reset5hAtMs,
+      resetWeeklyAtMs: liveResolved.resetWeeklyAtMs,
     };
   });
 

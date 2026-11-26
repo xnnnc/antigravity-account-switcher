@@ -16,6 +16,7 @@ import {
   readAccountRecord,
   readWindowsCredential,
   redactSecrets,
+  resolveEffectiveWindowQuota,
   setConfig,
   setLabel,
   sha256Hex,
@@ -340,6 +341,73 @@ async function main() {
       assert.equal(merged.accounts[0].quota5h, 79, 'Snapshot override 5h failed');
       assert.equal(merged.accounts[0].quotaWeekly, 93, 'Snapshot override 7d failed');
 
+      // C0) Local zero-network expiration resolution for 5h / 7d windows
+      const r5Expired = resolveEffectiveWindowQuota(
+        {
+          quota5h: 7,
+          quotaWeekly: 75,
+          reset5hAtMs: nowSec * 1000 - 1000,
+          resetWeeklyAtMs: nowSec * 1000 + 86400 * 1000,
+        },
+        nowSec * 1000
+      );
+      assert.equal(r5Expired.quota5h, 100, 'Expired 5h window should resolve to 100%');
+      assert.equal(r5Expired.reset5h, 'Hazır', 'Expired 5h reset should show Hazır');
+      assert.equal(r5Expired.quotaWeekly, 75, 'Weekly quota should remain 75%');
+
+      const r5WeeklyCap = resolveEffectiveWindowQuota(
+        {
+          quota5h: 0,
+          quotaWeekly: 0,
+          reset5hAtMs: nowSec * 1000 - 1000,
+          resetWeeklyAtMs: nowSec * 1000 + 86400 * 1000,
+        },
+        nowSec * 1000
+      );
+      assert.equal(r5WeeklyCap.quota5h, 0, 'Weekly cap exhausted (0%) must keep 5h at 0%');
+      assert.equal(r5WeeklyCap.reset5h, '—', 'Weekly cap exhausted should show — for 5h reset');
+
+      const rWeeklyExpired = resolveEffectiveWindowQuota(
+        {
+          quota5h: 0,
+          quotaWeekly: 0,
+          reset5hAtMs: nowSec * 1000 - 1000,
+          resetWeeklyAtMs: nowSec * 1000 - 500,
+        },
+        nowSec * 1000
+      );
+      assert.equal(rWeeklyExpired.quotaWeekly, 100, 'Expired weekly window should resolve to 100%');
+      assert.equal(rWeeklyExpired.quota5h, 100, 'Expired weekly window should also reset 5h to 100%');
+      assert.equal(rWeeklyExpired.resetWeekly, 'Hazır');
+      assert.equal(rWeeklyExpired.reset5h, 'Hazır');
+
+      // End-to-end via listAccounts() when cache file resetTime is in the past
+      const pastHash = sha256Hex(acc2.email.trim().toLowerCase());
+      fs.writeFileSync(
+        path.join(storeOpts.cacheDir, `${pastHash}.json`),
+        JSON.stringify({
+          updatedAt: nowSec - 10,
+          payload: {
+            quota_summary: {
+              groups: [
+                {
+                  displayName: 'Gemini Pro',
+                  buckets: [
+                    { window: '5h', remainingFraction: 0.07, resetTime: new Date((nowSec - 60) * 1000).toISOString() },
+                    { window: 'weekly', remainingFraction: 0.8, resetTime: new Date((nowSec + 3 * 86400) * 1000).toISOString() },
+                  ],
+                },
+              ],
+            },
+          },
+        }),
+        'utf8'
+      );
+      const expiredListed = await listAccounts({ ...storeOpts, nowMs: nowSec * 1000, skipCredRead: true });
+      assert.equal(expiredListed.accounts[1].quota5h, 100, 'End-to-end expired 5h cache should list as 100%');
+      assert.equal(expiredListed.accounts[1].reset5h, 'Hazır', 'End-to-end expired 5h reset should list as Hazır');
+      assert.equal(typeof expiredListed.accounts[1].reset5hAtMs, 'number', 'Account record should expose numeric reset5hAtMs');
+
       // C) Native switch dry-run: default launchOnSwitch=true, conditional OAuth refresh, atomic writes, 0 .bak
       const fetchCalls = [];
       const credWrites = [];
@@ -486,6 +554,8 @@ async function main() {
       assert.ok(/scrollbar-gutter:\s*stable/.test(uiSrc), 'Missing scrollbar-gutter: stable on .ag-as-list');
       assert.ok(/padding-right:\s*10px/.test(uiSrc), 'Missing padding-right: 10px on .ag-as-list');
       assert.ok(/\.ag-as-seg\s*\{[^}]*background:\s*transparent\s*!important/s.test(uiSrc), 'Missing background: transparent !important on .ag-as-seg');
+      assert.equal(uiSrc.includes("role: 'menuitem'"), false, 'ui-client.js still assigns role: menuitem');
+      assert.ok(uiSrc.includes('box-shadow: none !important'), 'Missing box-shadow: none !important on .ag-as-row-main');
       assert.ok(uiSrc.includes('ag-as-q-tag') && uiSrc.includes("'5h'") && uiSrc.includes("'7d'"), 'Missing tiny 5h/7d tags');
       assert.ok(uiSrc.includes('state.isSwitching = false'), 'Missing state.isSwitching = false reset');
       assert.ok(uiSrc.includes('__agAccountSwitcherOnUpdate'), 'Missing live push handler');
@@ -641,21 +711,24 @@ async function main() {
             if (!isHost) return { isHost: false };
             const api = window.__agAccountSwitcherUi;
             const footer = document.querySelector('[data-ag-as-footer="1"]');
-            const labelBtn = footer ? footer.querySelector('.ag-as-seg-label') : null;
-            const quotaBtn = footer ? footer.querySelector('.ag-as-seg-quota') : null;
+            const triggerBtn = footer ? footer.querySelector('button.ag-as-seg-trigger') : null;
+            const labelEl = triggerBtn ? triggerBtn.querySelector('.ag-as-seg-label') : null;
+            const quotaEl = triggerBtn ? triggerBtn.querySelector('.ag-as-seg-quota') : null;
             const settings = document.querySelector('[data-ag-as-settings="1"]');
-            if (!footer || !labelBtn || !quotaBtn || !settings) {
+            if (!footer || !triggerBtn || !labelEl || !quotaEl || !settings) {
               return { isHost: true, mounted: false };
             }
+            const sepCount = footer.querySelectorAll('.ag-as-sep').length;
             const footerBg = getComputedStyle(footer).backgroundColor;
-            const labelBg = getComputedStyle(labelBtn).backgroundColor;
-            const quotaBg = getComputedStyle(quotaBtn).backgroundColor;
+            const triggerBg = getComputedStyle(triggerBtn).backgroundColor;
+            const labelBg = getComputedStyle(labelEl).backgroundColor;
+            const quotaBg = getComputedStyle(quotaEl).backgroundColor;
             const settingsBg = getComputedStyle(settings).backgroundColor;
-            const tags = Array.from(quotaBtn.querySelectorAll('.ag-as-q-tag')).map((n) => n.textContent.trim());
-            const vals = Array.from(quotaBtn.querySelectorAll('.ag-as-q-val')).map((n) => n.textContent.trim());
+            const tags = Array.from(quotaEl.querySelectorAll('.ag-as-q-tag')).map((n) => n.textContent.trim());
+            const vals = Array.from(quotaEl.querySelectorAll('.ag-as-q-val')).map((n) => n.textContent.trim());
 
-            // Open popover via click
-            labelBtn.click();
+            // Open popover via unified trigger click
+            triggerBtn.click();
             const pop = document.getElementById('ag-as-popover');
             const list = pop ? pop.querySelector('.ag-as-list') : null;
             const listRect = list ? list.getBoundingClientRect() : null;
@@ -692,20 +765,19 @@ async function main() {
             const pulse5hText = pulseSr?.getElementById('five-balance')?.textContent?.trim() || null;
             const pulse7dText = pulseSr?.getElementById('week-balance')?.textContent?.trim() || null;
 
-            // Close popover cleanly
-            api.closePopover();
-
             return {
               isHost: true,
               mounted: true,
               apiState: api.getState(),
-              labelText: labelBtn.textContent.trim(),
-              quotaText: quotaBtn.textContent.trim(),
+              labelText: labelEl.textContent.trim(),
+              quotaText: quotaEl.textContent.trim(),
+              sepCount,
               tags,
               vals,
               pulse5hText,
               pulse7dText,
               footerBg,
+              triggerBg,
               labelBg,
               quotaBg,
               settingsBg,
@@ -718,11 +790,47 @@ async function main() {
               truncatedResets,
               clearances,
               greenDots,
-              popoverClosed: !document.getElementById('ag-as-popover'),
             };
           })()`);
 
           if (!domCheck.isHost) continue;
+
+          // Verify .ag-as-row-main stays transparent with no nested box-shadow on :hover
+          let rowMainHover = { bg: null, shadow: null };
+          try {
+            await session.send('DOM.enable', {}, 4000);
+            await session.send('CSS.enable', {}, 4000);
+            const doc = await session.send('DOM.getDocument', { depth: 3 }, 4000);
+            const qMain = await session.send(
+              'DOM.querySelector',
+              { nodeId: doc.root.nodeId, selector: '#ag-as-popover .ag-as-row.is-active .ag-as-row-main' },
+              4000
+            );
+            if (qMain?.nodeId) {
+              await session.send(
+                'CSS.forcePseudoState',
+                { nodeId: qMain.nodeId, forcedPseudoClasses: ['hover'] },
+                4000
+              );
+              rowMainHover = await session.evaluate(`(() => {
+                const el = document.querySelector('#ag-as-popover .ag-as-row.is-active .ag-as-row-main');
+                if (!el) return { bg: null, shadow: null };
+                const cs = getComputedStyle(el);
+                return { bg: cs.backgroundColor, shadow: cs.boxShadow };
+              })()`);
+              await session.send(
+                'CSS.forcePseudoState',
+                { nodeId: qMain.nodeId, forcedPseudoClasses: [] },
+                4000
+              );
+            }
+          } finally {
+            await session.evaluate('window.__agAccountSwitcherUi.closePopover()').catch(() => {});
+          }
+          const popoverClosed = await session.evaluate("!document.getElementById('ag-as-popover')");
+          assert.equal(rowMainHover.bg, 'rgba(0, 0, 0, 0)', `Hovered .ag-as-row-main bg not transparent: ${rowMainHover.bg}`);
+          assert.equal(rowMainHover.shadow, 'none', `Hovered .ag-as-row-main has unexpected boxShadow: ${rowMainHover.shadow}`);
+          domCheck.popoverClosed = popoverClosed;
           verifiedHostCount += 1;
           assert.equal(domCheck.mounted, true, 'Footer not mounted in host');
           assert.ok(domCheck.apiState.accountCount > 0, 'accountCount is 0');
@@ -752,8 +860,10 @@ async function main() {
               `Footer quota [${dom5h}%, ${dom7d}%] diverged from live cli-status-snapshot (before=[${snapBefore.p5h}%, ${snapBefore.p7d}%], after=[${snapAfter.p5h}%, ${snapAfter.p7d}%])`
             );
           }
+          assert.equal(domCheck.sepCount, 1, `Expected 1 divider in footer, got ${domCheck.sepCount}`);
           for (const [k, v] of [
             ['footerBg', domCheck.footerBg],
+            ['triggerBg', domCheck.triggerBg],
             ['labelBg', domCheck.labelBg],
             ['quotaBg', domCheck.quotaBg],
             ['settingsBg', domCheck.settingsBg],

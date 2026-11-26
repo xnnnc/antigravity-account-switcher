@@ -219,14 +219,16 @@
   let ourPulseBridge = null;
   let lastBridgeAtMs = 0;
   let livePollInFlight = false;
+  let lastFooterClockSig = '';
+  let lastPopoverClockSig = '';
 
   // Mounted DOM references
   let footerContainer = null;
   let settingsBtn = null;
-  let labelBtn = null;
+  let triggerBtn = null;
+  let labelSlot = null;
   let labelTextEl = null;
-  let quotaBtn = null;
-  let sep1 = null;
+  let quotaSlot = null;
   let sep2 = null;
   let fallbackWrap = null;
   let fallbackOrigParent = null;
@@ -252,26 +254,39 @@
     return `${clamped}%`;
   }
 
-  function formatResetTime(val) {
-    if (!val || typeof val !== 'string') return '';
-    const trimmed = val.trim();
-    if (!trimmed) return '';
-    if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
-      const targetMs = Date.parse(trimmed);
-      if (Number.isFinite(targetMs)) {
-        const diffSec = Math.max(0, Math.floor((targetMs - Date.now()) / 1000));
-        if (diffSec < 60) return '<1m';
-        const mins = Math.floor(diffSec / 60);
-        if (mins < 60) return `${mins}m`;
-        const hours = Math.floor(mins / 60);
-        const remMins = mins % 60;
-        if (hours < 24) return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`;
-        const days = Math.floor(hours / 24);
-        const remHours = hours % 24;
-        return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
+  function parseResetMs(val) {
+    if (val === null || val === undefined || val === '') return null;
+    if (typeof val === 'number') {
+      return Number.isFinite(val) && val > 0 ? Math.floor(val) : null;
+    }
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
+        const ms = Date.parse(trimmed);
+        return Number.isFinite(ms) && ms > 0 ? Math.floor(ms) : null;
       }
     }
-    return trimmed;
+    return null;
+  }
+
+  function formatResetTime(val, nowMs) {
+    if (val === null || val === undefined || val === '') return '';
+    const now = typeof nowMs === 'number' ? nowMs : Date.now();
+    const targetMs = parseResetMs(val);
+    if (targetMs !== null) {
+      const diffSec = Math.floor((targetMs - now) / 1000);
+      if (diffSec <= 0) return 'Hazır';
+      if (diffSec < 60) return '<1m';
+      const mins = Math.floor(diffSec / 60);
+      if (mins < 60) return `${mins}m`;
+      const hours = Math.floor(mins / 60);
+      const remMins = mins % 60;
+      if (hours < 24) return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`;
+      const days = Math.floor(hours / 24);
+      const remHours = hours % 24;
+      return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
+    }
+    return typeof val === 'string' ? val.trim() : '';
   }
 
   function appendQuotaPairNodes(container, q5h, qWeek) {
@@ -316,25 +331,52 @@
     return (acc.label || acc.defaultLabel || 'Hesap').trim();
   }
 
-  function getEffectiveQuota(acc) {
+  function getEffectiveQuota(acc, nowMs) {
+    const now = typeof nowMs === 'number' ? nowMs : Date.now();
     if (!acc) {
       return state.liveQuota || { quota5h: null, quotaWeekly: null, reset5h: null, resetWeekly: null };
     }
     const isAct = acc.id === state.activeId || !!acc.isCurrent;
     const lq = isAct ? state.liveQuota : null;
-    if (!lq) {
-      return {
-        quota5h: acc.quota5h ?? null,
-        quotaWeekly: acc.quotaWeekly ?? null,
-        reset5h: acc.reset5h ?? null,
-        resetWeekly: acc.resetWeekly ?? null,
-      };
+    let q5 =
+      lq && lq.quota5h !== null && lq.quota5h !== undefined
+        ? lq.quota5h
+        : (acc.quota5h ?? null);
+    let qW =
+      lq && lq.quotaWeekly !== null && lq.quotaWeekly !== undefined
+        ? lq.quotaWeekly
+        : (acc.quotaWeekly ?? null);
+    const r5Ms = parseResetMs(lq?.reset5h) ?? parseResetMs(acc.reset5hAtMs) ?? parseResetMs(acc.reset5h);
+    const rWMs = parseResetMs(lq?.resetWeekly) ?? parseResetMs(acc.resetWeeklyAtMs) ?? parseResetMs(acc.resetWeekly);
+
+    const weeklyExpired = Boolean(rWMs && rWMs <= now);
+    const fiveExpired = Boolean(r5Ms && r5Ms <= now);
+
+    let r5 = r5Ms ? formatResetTime(r5Ms, now) : (lq?.reset5h || acc.reset5h || null);
+    let rW = rWMs ? formatResetTime(rWMs, now) : (lq?.resetWeekly || acc.resetWeekly || null);
+
+    if (weeklyExpired) {
+      if (qW !== null || q5 !== null) {
+        qW = 100;
+        q5 = 100;
+      }
+      rW = 'Hazır';
+      r5 = 'Hazır';
+    } else if (fiveExpired) {
+      if (qW === 0) {
+        q5 = 0;
+        r5 = '—';
+      } else {
+        q5 = 100;
+        r5 = 'Hazır';
+      }
     }
+
     return {
-      quota5h: lq.quota5h !== null && lq.quota5h !== undefined ? lq.quota5h : (acc.quota5h ?? null),
-      quotaWeekly: lq.quotaWeekly !== null && lq.quotaWeekly !== undefined ? lq.quotaWeekly : (acc.quotaWeekly ?? null),
-      reset5h: lq.reset5h || acc.reset5h || null,
-      resetWeekly: lq.resetWeekly || acc.resetWeekly || null,
+      quota5h: q5,
+      quotaWeekly: qW,
+      reset5h: r5,
+      resetWeekly: rW,
     };
   }
 
@@ -501,10 +543,43 @@
     } catch {}
   }
 
+  function computeClockSignature() {
+    const nowMs = Date.now();
+    const act = getActiveAccount();
+    const effAct = getEffectiveQuota(act, nowMs);
+    const fSig = `${act?.id || ''}|${effAct.quota5h ?? ''}|${effAct.quotaWeekly ?? ''}|${effAct.reset5h || ''}|${effAct.resetWeekly || ''}`;
+    let pSig = '';
+    if (state.popoverOpen && state.accounts.length) {
+      pSig = state.accounts
+        .map((a) => {
+          const e = getEffectiveQuota(a, nowMs);
+          return `${a.id}:${e.quota5h ?? ''}:${e.quotaWeekly ?? ''}:${e.reset5h || ''}:${e.resetWeekly || ''}`;
+        })
+        .join(';');
+    }
+    return { fSig, pSig };
+  }
+
+  function syncClockTicksInMemory() {
+    if (destroyed) return;
+    const sigs = computeClockSignature();
+    if (sigs.fSig !== lastFooterClockSig) {
+      lastFooterClockSig = sigs.fSig;
+      updateFooterContent();
+    }
+    if (state.popoverOpen && !state.editingAccountId && sigs.pSig !== lastPopoverClockSig) {
+      lastPopoverClockSig = sigs.pSig;
+      renderPopover();
+    } else if (!state.popoverOpen) {
+      lastPopoverClockSig = '';
+    }
+  }
+
   async function pollInMemoryQuota() {
     if (destroyed || document.hidden || livePollInFlight) return;
     installPulseBridgeTap();
     const hasBar = syncFromPulseShadowDom();
+    syncClockTicksInMemory();
     if (hasBar || Date.now() - lastBridgeAtMs < 2500) return;
 
     const metricsHost = window.__agPrismMetricsBridge || window.agPulseHost;
@@ -588,10 +663,23 @@
       outline-offset: -1px;
     }
 
-    [${FOOTER_ATTR}="1"] .ag-as-seg-label {
+    [${FOOTER_ATTR}="1"] .ag-as-seg-trigger {
       flex: 1 1 0;
       min-width: 0;
-      padding: 0 6px;
+      padding: 0 7px;
+      justify-content: space-between;
+      gap: 8px;
+      text-align: left;
+    }
+
+    [${FOOTER_ATTR}="1"] .ag-as-seg-label {
+      display: inline-flex;
+      align-items: center;
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0;
+      background: transparent !important;
+      border: 0 !important;
       justify-content: flex-start;
       text-align: left;
       font-size: 12.5px;
@@ -606,8 +694,12 @@
     }
 
     [${FOOTER_ATTR}="1"] .ag-as-seg-quota {
+      display: inline-flex;
+      align-items: baseline;
       flex: 0 0 auto;
-      padding: 0 5px;
+      padding: 0;
+      background: transparent !important;
+      border: 0 !important;
       justify-content: center;
       font-family: var(--ag-cs-mono-stack, var(--font-mono, 'Google Sans Code', 'Cascadia Code', Consolas, ui-monospace, monospace));
       font-variant-numeric: tabular-nums;
@@ -616,6 +708,11 @@
       color: var(--muted-foreground, #8E91A1);
       white-space: nowrap;
       gap: 0;
+    }
+
+    [${FOOTER_ATTR}="1"] .ag-as-seg-trigger:hover .ag-as-seg-quota,
+    [${FOOTER_ATTR}="1"] .ag-as-seg-trigger[aria-expanded="true"] .ag-as-seg-quota {
+      color: var(--foreground, #F2F2F5);
     }
 
     [${FOOTER_ATTR}="1"] .ag-as-q-pair {
@@ -696,15 +793,25 @@
       display: none !important;
     }
 
+    html[data-ag-cs-sidebar="on"][data-ag-cs-sidebar-collapsed="1"] [${FOOTER_ATTR}="1"] .ag-as-seg-trigger,
+    [${FOOTER_ATTR}="1"][${COLLAPSED_ATTR}="1"] .ag-as-seg-trigger {
+      width: 40px !important;
+      height: auto !important;
+      min-height: 32px !important;
+      padding: 3px 0 !important;
+      justify-content: center !important;
+      gap: 0 !important;
+    }
+
     html[data-ag-cs-sidebar="on"][data-ag-cs-sidebar-collapsed="1"] [${FOOTER_ATTR}="1"] .ag-as-seg-quota,
     [${FOOTER_ATTR}="1"][${COLLAPSED_ATTR}="1"] .ag-as-seg-quota {
       flex-direction: column !important;
       align-items: center !important;
       justify-content: center !important;
-      width: 40px !important;
+      width: 100% !important;
       height: auto !important;
-      min-height: 32px !important;
-      padding: 3px 0 !important;
+      min-height: 26px !important;
+      padding: 0 !important;
       gap: 1px !important;
       font-size: 10.5px !important;
       line-height: 1.15 !important;
@@ -896,7 +1003,10 @@
       opacity: 0.48;
     }
 
-    #${POPOVER_ID} .ag-as-row-main {
+    #${POPOVER_ID} .ag-as-row .ag-as-row-main,
+    #${POPOVER_ID} .ag-as-row .ag-as-row-main:hover,
+    #${POPOVER_ID} .ag-as-row .ag-as-row-main:focus,
+    #${POPOVER_ID} .ag-as-row .ag-as-row-main:active {
       grid-column: 1 / 4;
       display: grid;
       grid-template-columns: minmax(0, 1fr) 54px 54px;
@@ -904,6 +1014,10 @@
       gap: 6px;
       min-width: 0;
       padding: 0;
+      border: 0 !important;
+      background: transparent !important;
+      background-color: transparent !important;
+      box-shadow: none !important;
       border-radius: var(--ag-cs-r-sm, 4px);
       cursor: pointer;
       outline: none;
@@ -1202,7 +1316,7 @@
       }
       if (fallbackWrap.parentNode) fallbackWrap.parentNode.removeChild(fallbackWrap);
     }
-    for (const el of [labelBtn, sep1, quotaBtn, sep2]) {
+    for (const el of [triggerBtn, sep2]) {
       if (el && el.parentNode) el.parentNode.removeChild(el);
     }
     if (footerContainer) {
@@ -1214,10 +1328,10 @@
     }
     footerContainer = null;
     settingsBtn = null;
-    labelBtn = null;
+    triggerBtn = null;
+    labelSlot = null;
     labelTextEl = null;
-    quotaBtn = null;
-    sep1 = null;
+    quotaSlot = null;
     sep2 = null;
     fallbackWrap = null;
     fallbackOrigParent = null;
@@ -1225,7 +1339,7 @@
   }
 
   function updateFooterContent() {
-    if (!labelBtn || !quotaBtn || !labelTextEl) return;
+    if (!triggerBtn || !labelSlot || !quotaSlot || !labelTextEl) return;
     const active = getActiveAccount();
     const label = getDisplayLabel(active);
     const eff = getEffectiveQuota(active);
@@ -1235,15 +1349,12 @@
     const qWeek = formatQuotaPct(qWeekRaw);
 
     labelTextEl.textContent = label;
-    labelBtn.setAttribute('title', `${label} · 5h ${q5h} · 7d ${qWeek}`);
-    labelBtn.setAttribute('aria-label', `Aktif hesap: ${label}`);
-    labelBtn.setAttribute('aria-expanded', state.popoverOpen ? 'true' : 'false');
+    quotaSlot.textContent = '';
+    appendQuotaPairNodes(quotaSlot, q5hRaw, qWeekRaw);
 
-    quotaBtn.textContent = '';
-    appendQuotaPairNodes(quotaBtn, q5hRaw, qWeekRaw);
-    quotaBtn.setAttribute('title', `${label} · 5h ${q5h} · 7d ${qWeek}`);
-    quotaBtn.setAttribute('aria-label', `Kalan kota: 5h ${q5h}, 7d ${qWeek}`);
-    quotaBtn.setAttribute('aria-expanded', state.popoverOpen ? 'true' : 'false');
+    triggerBtn.setAttribute('title', `${label} · 5h ${q5h} · 7d ${qWeek}`);
+    triggerBtn.setAttribute('aria-label', `Aktif hesap: ${label} · 5h ${q5h}, 7d ${qWeek}`);
+    triggerBtn.setAttribute('aria-expanded', state.popoverOpen ? 'true' : 'false');
   }
 
   function mountFooter() {
@@ -1255,10 +1366,12 @@
 
     const alreadyValid =
       settingsBtn === targetSettings &&
-      labelBtn &&
-      labelBtn.isConnected &&
-      quotaBtn &&
-      quotaBtn.isConnected &&
+      triggerBtn &&
+      triggerBtn.isConnected &&
+      labelSlot &&
+      labelSlot.isConnected &&
+      quotaSlot &&
+      quotaSlot.isConnected &&
       targetSettings.isConnected;
 
     if (alreadyValid) {
@@ -1275,30 +1388,22 @@
       (c) => c.getAttribute(OWNED_ATTR) !== '1'
     );
 
-    labelBtn = createEl('button', 'ag-as-seg ag-as-seg-label', {
+    triggerBtn = createEl('button', 'ag-as-seg ag-as-seg-trigger', {
       type: 'button',
-      'aria-haspopup': 'menu',
+      'aria-haspopup': 'dialog',
       'aria-expanded': 'false',
     });
+    labelSlot = createEl('span', 'ag-as-seg-label');
     labelTextEl = createEl('span', 'ag-as-label-text');
-    labelBtn.appendChild(labelTextEl);
+    labelSlot.appendChild(labelTextEl);
+    quotaSlot = createEl('span', 'ag-as-seg-quota');
 
-    sep1 = createEl('span', 'ag-as-sep', { 'aria-hidden': 'true' });
-
-    quotaBtn = createEl('button', 'ag-as-seg ag-as-seg-quota', {
-      type: 'button',
-      'aria-haspopup': 'menu',
-      'aria-expanded': 'false',
-    });
+    triggerBtn.appendChild(labelSlot);
+    triggerBtn.appendChild(quotaSlot);
 
     sep2 = createEl('span', 'ag-as-sep', { 'aria-hidden': 'true' });
 
-    labelBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      togglePopover();
-    });
-    quotaBtn.addEventListener('click', (e) => {
+    triggerBtn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       togglePopover();
@@ -1310,9 +1415,7 @@
       // Safe inline sibling injection: native Settings button stays in its React parent
       footerContainer = parent;
       footerContainer.setAttribute(FOOTER_ATTR, '1');
-      footerContainer.insertBefore(labelBtn, settingsBtn);
-      footerContainer.insertBefore(sep1, settingsBtn);
-      footerContainer.insertBefore(quotaBtn, settingsBtn);
+      footerContainer.insertBefore(triggerBtn, settingsBtn);
       footerContainer.insertBefore(sep2, settingsBtn);
     } else {
       // Fallback wrapper if parent holds additional native buttons
@@ -1324,9 +1427,7 @@
       footerContainer.setAttribute(FOOTER_ATTR, '1');
       parent.insertBefore(footerContainer, settingsBtn);
       footerContainer.appendChild(fallbackWrap);
-      fallbackWrap.appendChild(labelBtn);
-      fallbackWrap.appendChild(sep1);
-      fallbackWrap.appendChild(quotaBtn);
+      fallbackWrap.appendChild(triggerBtn);
       fallbackWrap.appendChild(sep2);
       fallbackWrap.appendChild(settingsBtn);
     }
@@ -1366,7 +1467,7 @@
   function positionPopover() {
     if (!popoverEl) return;
     const collapsed = isSidebarCollapsed();
-    const anchor = (collapsed ? quotaBtn : footerContainer || labelBtn) || settingsBtn;
+    const anchor = (collapsed ? triggerBtn : footerContainer || triggerBtn) || settingsBtn;
     if (!anchor || !anchor.getBoundingClientRect) return;
     const rect = anchor.getBoundingClientRect();
     const popWidth = 324;
@@ -1545,7 +1646,7 @@
     if (!popoverEl) {
       popoverEl = createEl('div', '', {
         id: POPOVER_ID,
-        role: 'menu',
+        role: 'dialog',
         'aria-label': 'Hesap Değiştirici',
       });
       popoverEl.addEventListener('click', (e) => {
@@ -1615,7 +1716,7 @@
         );
 
         const main = createEl('div', 'ag-as-row-main', {
-          role: 'menuitem',
+          role: 'button',
           tabindex: acc.disabled ? '-1' : '0',
           'aria-disabled': acc.disabled ? 'true' : 'false',
         });
@@ -1758,8 +1859,7 @@
     if (!state.popoverOpen) return;
     const t = e.target;
     if (popoverEl && popoverEl.contains(t)) return;
-    if (labelBtn && labelBtn.contains(t)) return;
-    if (quotaBtn && quotaBtn.contains(t)) return;
+    if (triggerBtn && triggerBtn.contains(t)) return;
     closePopover();
   }
 
@@ -1918,7 +2018,7 @@
       accountCount: state.accounts.length,
       popoverOpen: state.popoverOpen,
       isSwitching: state.isSwitching,
-      mounted: !!(labelBtn && labelBtn.isConnected),
+      mounted: !!(triggerBtn && triggerBtn.isConnected),
     }),
   };
 
