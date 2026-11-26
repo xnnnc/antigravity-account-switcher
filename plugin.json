@@ -1,0 +1,9 @@
+{
+  "name": "antigravity-account-switcher",
+  "displayName": "Account Switcher",
+  "version": "1.0.0",
+  "description": "Zero-ASAR native boxless Antigravity account switcher with live 5h/7d quota sync, custom labels, and Windows Credential Manager parity.",
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/xnnnc/antigravity-account-switcher",
+  "repository": "https://github.com/xnnnc/antigravity-account-switcher"
+}

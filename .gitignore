@@ -1,0 +1,20 @@
+# Logs & runtime state
+*.log
+*.pid
+*.bak
+*.tmp
+*.lock
+
+# Local user overrides (never commit personal labels/configs)
+*-labels.json
+*-config.json
+
+# Dependencies & OS files
+node_modules/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Scratch / temporary
+scratch/
+*.out.png

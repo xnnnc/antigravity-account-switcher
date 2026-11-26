@@ -1,0 +1,8 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Antigravity Account Switcher",
+  "description": "Native boxless account switcher reading Cockpit Tools storage.",
+  "has_web_ui": false
+}
