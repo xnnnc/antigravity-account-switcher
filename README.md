@@ -108,6 +108,30 @@ git clone https://github.com/xnnnc/antigravity-account-switcher.git "$env:USERPR
 
 ---
 
+## Güncelleme
+
+> [!NOTE]
+> Kullanıcı tanımlı özel hesap etiketleri (`%USERPROFILE%\.gemini\config\antigravity-account-switcher-labels.json`) eklenti klasörü **dışında** saklandığı için güncelleme sırasında korunur.
+
+### Yöntem 1: Git ile Kurduysanız (Önerilen)
+
+```powershell
+git -C "$env:USERPROFILE\.gemini\config\plugins\antigravity-account-switcher" pull --ff-only
+```
+
+### Yöntem 2: ZIP ile Kurduysanız
+
+1. [Son sürümü / depoyu ZIP olarak indirin](https://github.com/xnnnc/antigravity-account-switcher/archive/refs/heads/main.zip).
+2. İçeriği mevcut `%USERPROFILE%\.gemini\config\plugins\antigravity-account-switcher` klasörünün üzerine çıkarın.
+
+### Güncelleme Sonrası Yeniden Yükleme
+
+Antigravity, eklentinin arka plan sürecini (`sidecars/daemon/main.mjs`) bellekte tutar. Yeni sürümün aktif olması için güncelledikten sonra:
+
+1. Antigravity → **Plugins / Customizations** sayfasından **Account Switcher** eklentisini kapatıp tekrar açın *(veya Antigravity'yi yeniden başlatın)*.
+
+---
+
 ## Test ve Doğrulama
 
 Kurulumdan sonra bütünlüğü doğrulamak için eklenti dizininde doğrulama paketini çalıştırabilirsiniz *(canlı Antigravity oturumunuza veya canlı kimlik bilgilerinize zarar vermez; tüm yazma testleri izole geçici klasörlerde ve ayrılabilir test hedeflerinde koşar)*:

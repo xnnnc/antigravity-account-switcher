@@ -92,6 +92,30 @@ git clone https://github.com/xnnnc/antigravity-account-switcher.git "$env:USERPR
 
 ---
 
+## Updating
+
+> [!NOTE]
+> Custom account labels are stored **outside** the plugin folder at `%USERPROFILE%\.gemini\config\antigravity-account-switcher-labels.json`, so your labels are preserved across updates.
+
+### Option 1: Git Clone (Recommended)
+
+```powershell
+git -C "$env:USERPROFILE\.gemini\config\plugins\antigravity-account-switcher" pull --ff-only
+```
+
+### Option 2: Manual ZIP
+
+1. Download the [latest archive](https://github.com/xnnnc/antigravity-account-switcher/archive/refs/heads/main.zip).
+2. Extract and overwrite the existing `%USERPROFILE%\.gemini\config\plugins\antigravity-account-switcher` folder.
+
+### Reloading After Update
+
+Antigravity keeps the plugin sidecar (`sidecars/daemon/main.mjs`) running in memory. To apply backend and UI changes:
+
+1. Toggle **Account Switcher** off and back on under Antigravity → **Plugins / Customizations** *(or restart Antigravity)*.
+
+---
+
 ## Verification & Uninstall
 
 Run the non-destructive test suite (uses isolated temp directories and a disposable test credential target — never touches live Antigravity or live credentials):
